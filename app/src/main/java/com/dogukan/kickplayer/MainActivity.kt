@@ -3,6 +3,7 @@ package com.dogukan.kickplayer
 import android.annotation.SuppressLint
 import android.app.PictureInPictureParams
 import android.content.Context
+import android.content.pm.ActivityInfo
 import android.content.res.Configuration
 import android.graphics.Color
 import android.os.Build
@@ -11,6 +12,8 @@ import android.util.Rational
 import android.view.View
 import android.view.ViewGroup
 import android.view.WindowManager
+import android.view.inputmethod.EditorInfo
+import android.view.inputmethod.InputMethodManager
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.Button
@@ -20,12 +23,18 @@ import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
+import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
+import androidx.media3.common.TrackSelectionOverride
+import androidx.media3.common.Tracks
+import androidx.media3.common.VideoSize
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.ExoPlayer
-import androidx.media3.exoplayer.trackselection.DefaultTrackSelector
 import androidx.media3.ui.PlayerView
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -36,32 +45,60 @@ import kotlin.concurrent.thread
 class MainActivity : AppCompatActivity() {
 
     private lateinit var player: ExoPlayer
-    private lateinit var trackSelector: DefaultTrackSelector
     private lateinit var playerView: PlayerView
-    private lateinit var webView: WebView
+    private lateinit var webView: WebView   // yedek: kick.com sayfası
+    private lateinit var chatView: WebView
+    private lateinit var videoBox: FrameLayout
     private lateinit var status: TextView
     private lateinit var topBar: LinearLayout
+    private lateinit var recentRow: HorizontalScrollView
+    private lateinit var recentLayout: LinearLayout
     private lateinit var qualityRow: HorizontalScrollView
+    private lateinit var qualityLayout: LinearLayout
     private lateinit var channelInput: EditText
 
     private val qualityButtons = mutableListOf<Pair<Int, Button>>()
     private val client = OkHttpClient()
     private val prefs by lazy { getSharedPreferences("kick", Context.MODE_PRIVATE) }
-    private var inPip = false
 
-    // Ekran uykuya girmesin: pencere bayrağı, uygulama açık olduğu sürece geçerli.
+    private var inPip = false
+    private var fallback = false
+    private var chatOn = true
+    private var currentSlug = ""
+    private var currentHeight = 0
+    private var availableHeights: List<Int> = emptyList()
+    private var trackChoices: Map<Int, Triple<Int, Tracks.Group, Int>> = emptyMap()
+    private var selectedHeight = 0 // 0 = Auto
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // Ekran uykuya girmesin.
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        chatOn = prefs.getBoolean("chatOn", true)
 
         buildUi()
         initPlayer()
-
-        applyQuality(prefs.getInt("maxHeight", 0))
+        rebuildRecent()
+        rebuildQualityButtons()
         updateChrome()
     }
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+    private fun chip(label: String, onClick: () -> Unit) = Button(this).apply {
+        text = label
+        isAllCaps = false
+        setOnClickListener { onClick() }
+    }
+
+    @SuppressLint("SetJavaScriptEnabled")
+    private fun setupWeb(w: WebView) {
+        w.settings.javaScriptEnabled = true
+        w.settings.domStorageEnabled = true
+        w.settings.mediaPlaybackRequiresUserGesture = false
+        w.webViewClient = WebViewClient()
+        w.setBackgroundColor(Color.BLACK)
+    }
 
     private fun buildUi() {
         val root = LinearLayout(this).apply {
@@ -74,12 +111,11 @@ class MainActivity : AppCompatActivity() {
             setTextColor(Color.WHITE)
             setHintTextColor(Color.GRAY)
             setSingleLine()
+            imeOptions = EditorInfo.IME_ACTION_GO
             setText(prefs.getString("channel", ""))
+            setOnEditorActionListener { _, _, _ -> startChannel(); true }
         }
-        val playBtn = Button(this).apply {
-            text = "İzle"
-            setOnClickListener { startChannel() }
-        }
+        val playBtn = chip("İzle") { startChannel() }
         topBar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             setPadding(dp(8), dp(8), dp(8), 0)
@@ -87,21 +123,15 @@ class MainActivity : AppCompatActivity() {
             addView(playBtn)
         }
 
-        val qualityLayout = LinearLayout(this).apply {
+        recentLayout = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             setPadding(dp(8), 0, dp(8), 0)
         }
-        val options = listOf("Auto" to 0, "1080p" to 1080, "720p" to 720, "480p" to 480, "360p" to 360)
-        for ((label, height) in options) {
-            val b = Button(this).apply {
-                text = label
-                setOnClickListener {
-                    prefs.edit().putInt("maxHeight", height).apply()
-                    applyQuality(height)
-                }
-            }
-            qualityButtons.add(height to b)
-            qualityLayout.addView(b)
+        recentRow = HorizontalScrollView(this).apply { addView(recentLayout) }
+
+        qualityLayout = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(dp(8), 0, dp(8), 0)
         }
         qualityRow = HorizontalScrollView(this).apply { addView(qualityLayout) }
 
@@ -112,44 +142,159 @@ class MainActivity : AppCompatActivity() {
         }
 
         playerView = PlayerView(this).apply {
+            setShowNextButton(false)
+            setShowPreviousButton(false)
+            setShowRewindButton(false)
+            setShowFastForwardButton(false)
+            setFullscreenButtonClickListener { isFull -> toggleFullscreen(isFull) }
             visibility = View.GONE
         }
-        webView = WebView(this).apply {
-            visibility = View.GONE
-        }
-        val content = FrameLayout(this).apply {
+        webView = WebView(this).apply { visibility = View.GONE }
+        setupWeb(webView)
+        videoBox = FrameLayout(this).apply {
             addView(playerView, FrameLayout.LayoutParams(-1, -1))
             addView(webView, FrameLayout.LayoutParams(-1, -1))
         }
 
+        chatView = WebView(this)
+        setupWeb(chatView)
+
         root.addView(topBar)
+        root.addView(recentRow)
         root.addView(qualityRow)
         root.addView(status)
-        root.addView(content, LinearLayout.LayoutParams(-1, 0, 1f))
+        root.addView(videoBox, LinearLayout.LayoutParams(-1, resources.displayMetrics.widthPixels * 9 / 16))
+        root.addView(chatView, LinearLayout.LayoutParams(-1, 0, 1f))
         setContentView(root)
     }
 
     private fun initPlayer() {
-        trackSelector = DefaultTrackSelector(this)
-        player = ExoPlayer.Builder(this).setTrackSelector(trackSelector).build()
+        player = ExoPlayer.Builder(this).build()
         player.addListener(object : Player.Listener {
             override fun onPlayerError(error: PlaybackException) {
                 status.text = "Oynatma hatası: ${error.errorCodeName}"
+            }
+
+            override fun onVideoSizeChanged(videoSize: VideoSize) {
+                currentHeight = videoSize.height
+                updateStatus()
+            }
+
+            override fun onTracksChanged(tracks: Tracks) {
+                onTracks(tracks)
             }
         })
         playerView.player = player
     }
 
-    // Kalite tercihi kalıcı: her yayında ve uygulama yeniden açılınca aynı üst sınır uygulanır.
-    // 0 = Auto (sınırsız). Ağ kötüleşirse oynatıcı yine de seçilen sınırın altına inebilir.
-    private fun applyQuality(maxHeight: Int) {
-        val h = if (maxHeight == 0) Int.MAX_VALUE else maxHeight
-        val w = if (maxHeight == 0) Int.MAX_VALUE else maxHeight * 16 / 9 + 1
-        trackSelector.parameters = trackSelector.buildUponParameters()
-            .setMaxVideoSize(w, h)
-            .build()
-        for ((height, b) in qualityButtons) {
-            b.alpha = if (height == maxHeight) 1f else 0.5f
+    private fun updateStatus() {
+        if (fallback || currentSlug.isEmpty()) return
+        val q = if (currentHeight > 0) " · ${currentHeight}p" else ""
+        status.text = "Yayın: $currentSlug$q"
+    }
+
+    // Yayının gerçekten sunduğu kaliteleri bul (her yükseklik için en yüksek bitrate'li olanı).
+    private fun onTracks(tracks: Tracks) {
+        val best = HashMap<Int, Triple<Int, Tracks.Group, Int>>()
+        for (g in tracks.groups) {
+            if (g.type != C.TRACK_TYPE_VIDEO) continue
+            for (i in 0 until g.length) {
+                if (!g.isTrackSupported(i)) continue
+                val h = g.getTrackFormat(i).height
+                if (h <= 0) continue
+                val old = best[h]
+                if (old == null ||
+                    g.getTrackFormat(i).bitrate > old.second.getTrackFormat(old.third).bitrate
+                ) {
+                    best[h] = Triple(h, g, i)
+                }
+            }
+        }
+        val heights = best.keys.sortedDescending()
+        if (heights == availableHeights) return
+        availableHeights = heights
+        trackChoices = best
+        applyQualityPreference()
+        rebuildQualityButtons()
+    }
+
+    private fun applyQualityPreference() {
+        selectQuality(prefs.getInt("maxHeight", 0), false)
+    }
+
+    // pref 0 = Auto. Aksi halde o kaliteye (ya da en yakın düşüğüne) sabitlenir.
+    private fun selectQuality(pref: Int, save: Boolean) {
+        if (save) prefs.edit().putInt("maxHeight", pref).apply()
+        val params = player.trackSelectionParameters.buildUpon()
+        val target = if (pref == 0 || availableHeights.isEmpty()) {
+            0
+        } else {
+            availableHeights.firstOrNull { it <= pref } ?: availableHeights.last()
+        }
+        val choice = trackChoices[target]
+        if (target == 0 || choice == null) {
+            params.clearOverridesOfType(C.TRACK_TYPE_VIDEO)
+            selectedHeight = 0
+        } else {
+            params.setOverrideForType(TrackSelectionOverride(choice.second.mediaTrackGroup, choice.third))
+            selectedHeight = target
+        }
+        player.trackSelectionParameters = params.build()
+        refreshQualityHighlight()
+    }
+
+    private fun refreshQualityHighlight() {
+        for ((h, b) in qualityButtons) {
+            b.alpha = if (h == selectedHeight) 1f else 0.5f
+        }
+    }
+
+    private fun rebuildQualityButtons() {
+        qualityLayout.removeAllViews()
+        qualityButtons.clear()
+        qualityLayout.addView(chip(if (chatOn) "Sohbet: açık" else "Sohbet: kapalı") { toggleChat() })
+        val auto = chip("Auto") { selectQuality(0, true) }
+        qualityButtons.add(0 to auto)
+        qualityLayout.addView(auto)
+        for (h in availableHeights) {
+            val b = chip("${h}p") { selectQuality(h, true) }
+            qualityButtons.add(h to b)
+            qualityLayout.addView(b)
+        }
+        refreshQualityHighlight()
+    }
+
+    private fun toggleChat() {
+        chatOn = !chatOn
+        prefs.edit().putBoolean("chatOn", chatOn).apply()
+        if (chatOn) loadChat()
+        rebuildQualityButtons()
+        updateChrome()
+    }
+
+    private fun loadChat() {
+        if (currentSlug.isEmpty() || !chatOn) return
+        if (chatView.url?.contains("/$currentSlug/") == true) return
+        chatView.loadUrl("https://kick.com/popout/$currentSlug/chat")
+    }
+
+    private fun recentList(): List<String> =
+        (prefs.getString("recent", "") ?: "").split(",").filter { it.isNotBlank() }
+
+    private fun addRecent(slug: String) {
+        val list = (listOf(slug) + recentList().filter { it != slug }).take(8)
+        prefs.edit().putString("recent", list.joinToString(",")).apply()
+        rebuildRecent()
+        updateChrome()
+    }
+
+    private fun rebuildRecent() {
+        recentLayout.removeAllViews()
+        for (s in recentList()) {
+            recentLayout.addView(chip(s) {
+                channelInput.setText(s)
+                startChannel()
+            })
         }
     }
 
@@ -158,7 +303,11 @@ class MainActivity : AppCompatActivity() {
             .substringAfterLast('/')
             .replace('_', '-')
         if (slug.isEmpty()) return
+        (getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager)
+            .hideSoftInputFromWindow(channelInput.windowToken, 0)
         prefs.edit().putString("channel", slug).apply()
+        currentSlug = slug
+        currentHeight = 0
         status.text = "Bağlanıyor…"
         thread {
             try {
@@ -190,36 +339,74 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun playHls(slug: String, url: String) {
+        fallback = false
         webView.visibility = View.GONE
         webView.loadUrl("about:blank")
         playerView.visibility = View.VISIBLE
+        availableHeights = emptyList()
+        trackChoices = emptyMap()
+        selectedHeight = 0
+        player.trackSelectionParameters = player.trackSelectionParameters.buildUpon()
+            .clearOverridesOfType(C.TRACK_TYPE_VIDEO)
+            .build()
         player.setMediaItem(MediaItem.fromUri(url))
         player.prepare()
         player.playWhenReady = true
-        status.text = "Yayın: $slug"
+        addRecent(slug)
+        loadChat()
+        rebuildQualityButtons()
+        updateStatus()
+        updateChrome()
     }
 
-    @SuppressLint("SetJavaScriptEnabled")
     private fun fallbackToWeb(slug: String, reason: String) {
+        fallback = true
         player.stop()
         playerView.visibility = View.GONE
         webView.visibility = View.VISIBLE
-        webView.settings.javaScriptEnabled = true
-        webView.settings.domStorageEnabled = true
-        webView.settings.mediaPlaybackRequiresUserGesture = false
-        webView.webViewClient = WebViewClient()
         webView.loadUrl("https://kick.com/$slug")
         status.text = "Doğrudan akış alınamadı ($reason), web oynatıcıya geçildi"
+        updateChrome()
     }
 
-    // Yatayda ve PiP'te kontrolleri gizle, sadece video kalsın.
+    private fun toggleFullscreen(full: Boolean) {
+        requestedOrientation = if (full) {
+            ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+        } else {
+            ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+        }
+    }
+
+    private fun setImmersive(on: Boolean) {
+        val c = WindowCompat.getInsetsController(window, window.decorView)
+        c.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        if (on) c.hide(WindowInsetsCompat.Type.systemBars()) else c.show(WindowInsetsCompat.Type.systemBars())
+    }
+
+    // Dikeyde: üstte kontroller, 16:9 video, altta sohbet. Yatayda ve PiP'te sadece video.
     private fun updateChrome() {
         val landscape = resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
-        val vis = if (inPip || landscape) View.GONE else View.VISIBLE
-        topBar.visibility = vis
-        qualityRow.visibility = vis
-        status.visibility = vis
+        val compact = landscape || inPip
+        val chromeVis = if (compact) View.GONE else View.VISIBLE
+        topBar.visibility = chromeVis
+        status.visibility = chromeVis
+        recentRow.visibility = if (!compact && recentLayout.childCount > 0) View.VISIBLE else View.GONE
+        qualityRow.visibility = if (!compact && !fallback) View.VISIBLE else View.GONE
+
+        val fill = compact || fallback
+        val lp = videoBox.layoutParams as LinearLayout.LayoutParams
+        if (fill) {
+            lp.height = 0
+            lp.weight = 1f
+        } else {
+            lp.height = resources.displayMetrics.widthPixels * 9 / 16
+            lp.weight = 0f
+        }
+        videoBox.layoutParams = lp
+        chatView.visibility = if (!fill && chatOn) View.VISIBLE else View.GONE
+
         playerView.useController = !inPip
+        setImmersive(landscape && !inPip)
     }
 
     override fun onConfigurationChanged(newConfig: Configuration) {
@@ -246,5 +433,6 @@ class MainActivity : AppCompatActivity() {
         super.onDestroy()
         player.release()
         webView.destroy()
+        chatView.destroy()
     }
 }
